@@ -1264,3 +1264,167 @@ fn v_cmp_class_f16_matches_rdna2() {
         );
     });
 }
+
+/// `v_cvt_f32_f64` as IEEE round-to-nearest-even with f32 denormals kept
+/// (Rust's `as` conversion); a NaN only needs to stay a NaN.
+fn check_cvt_f32_f64(backend: &str, what: &str, x: u64, got: u32) {
+    let want = f64::from_bits(x) as f32;
+    if want.is_nan() {
+        assert!(
+            f32::from_bits(got).is_nan(),
+            "{backend}: v_cvt_f32_f64({what} {x:#018x}) = {got:#010x}, want NaN"
+        );
+    } else {
+        assert_eq!(
+            got,
+            want.to_bits(),
+            "{backend}: v_cvt_f32_f64({what} {x:#018x} = {:e}) = {got:#010x} ({:e}), want {:#010x} ({want:e})",
+            f64::from_bits(x),
+            f32::from_bits(got),
+            want.to_bits(),
+        );
+    }
+}
+
+#[test]
+fn v_cvt_f32_f64_rounds_to_nearest_even_with_denormals() {
+    // v_cvt_f32_f64 v0, v[1:2] (VOP1 opcode 0x00f)
+    let shader = build_valu_cs(&[vop1(0x00F, 0, vgpr(1))]);
+    let b = f64::to_bits;
+    let min_normal = b(f64::from(f32::MIN_POSITIVE));
+    let min_denormal = 1.0f64 * 2f64.powi(-149);
+    let mut cases: Vec<u64> = vec![
+        b(0.0),
+        b(-0.0),
+        b(1.0),
+        b(-1.5),
+        b(0.1),
+        b(-1e-3),
+        b(std::f64::consts::PI),
+        b(f64::from(f32::MAX)),
+        b(-f64::from(f32::MAX)),
+        // Just below and at the halfway point to the next f32 above MAX:
+        // rounds to MAX, then to infinity.
+        b(f64::from(f32::MAX)) + (1 << 28) - 1,
+        b(f64::from(f32::MAX)) + (1 << 28),
+        b(1e39),
+        b(-1e300),
+        b(f64::MAX),
+        b(f64::INFINITY),
+        b(f64::NEG_INFINITY),
+        b(f64::NAN),
+        0xFFF0_0000_0000_0001, // a signalling NaN, sign set
+        0x7FF0_0000_2000_0000, // a NaN whose payload reaches the f32
+        // Ties at 29 dropped bits: to even down (even kept), up (odd kept).
+        b(1.0) | 1 << 28,
+        b(1.0) | 1 << 29 | 1 << 28,
+        b(1.0) | 1 << 28 | 1,
+        b(1.0) | ((1 << 29) - 1),
+        // All mantissa ones: the carry raises the exponent.
+        b(1.0) | ((1 << 52) - 1),
+        // f32 denormals, around the smallest normal and the smallest one.
+        min_normal,
+        min_normal - 1,
+        min_normal - (1 << 29),
+        b(f64::from(f32::MIN_POSITIVE) * 0.5),
+        b(f64::from(f32::MIN_POSITIVE) * 0.75 + 1e-50),
+        b(min_denormal),
+        b(min_denormal * 1.5),
+        b(min_denormal * 2.5),
+        b(min_denormal * 0.5),
+        b(min_denormal * 0.5) + 1,
+        b(-min_denormal * 0.75),
+        b(min_denormal * 0.25),
+        b(1e-300),
+        1, // the smallest f64 denormal
+        0x800F_FFFF_FFFF_FFFF,
+    ];
+    // And a spread of bit patterns (xorshift, every exponent likely).
+    let mut r = 0x9E37_79B9_7F4A_7C15u64;
+    for _ in 0..400 {
+        r ^= r << 13;
+        r ^= r >> 7;
+        r ^= r << 17;
+        // Bias half of them to the f32 range, where the rounding is.
+        let x = if r & 1 == 0 {
+            r
+        } else {
+            let exp = 1023 - 160 + (r >> 52) % 300;
+            (r & 0x800F_FFFF_FFFF_FFFF) | exp << 52
+        };
+        cases.push(x);
+    }
+    let inputs: Vec<[u32; 4]> = cases
+        .iter()
+        .map(|&x| [x as u32, (x >> 32) as u32, 0, 0])
+        .collect();
+    run_cases(&shader, &inputs, |backend, i, _, got| {
+        check_cvt_f32_f64(backend, "", cases[i], got);
+    });
+}
+
+#[test]
+fn v_cvt_f32_f64_takes_modifiers_and_f64_constants() {
+    let b = f64::to_bits;
+    let inputs: Vec<[u32; 4]> = [b(-2.75), b(3.0e-40), b(1.0)]
+        .iter()
+        .map(|&x| [x as u32, (x >> 32) as u32, 0, 0])
+        .collect();
+    // VOP3 (opcode 0x180 + 0x00f) with abs, neg, both, and clamp.
+    for (abs, neg, clamp, what) in [
+        (1, 0, false, "|x|"),
+        (0, 1, false, "-x"),
+        (1, 1, false, "-|x|"),
+        (0, 0, true, "clamp"),
+    ] {
+        let shader = build_valu_cs(&vop3_mod(0x18F, 0, vgpr(1), 0, 0, abs, neg, 0, clamp));
+        run_cases(&shader, &inputs, |backend, i, inp, got| {
+            let x = u64::from(inp[0]) | u64::from(inp[1]) << 32;
+            let mut y = f64::from_bits(x);
+            if abs != 0 {
+                y = y.abs();
+            }
+            if neg != 0 {
+                y = -y;
+            }
+            let mut want = y as f32;
+            if clamp {
+                want = want.clamp(0.0, 1.0);
+                // The clamp is DXIL's saturate, which a card may flush a
+                // denormal through (DXIL's f32 denormal mode is "any").
+                if want.is_subnormal() && got == 0 {
+                    return;
+                }
+            }
+            assert_eq!(
+                got,
+                want.to_bits(),
+                "{backend}: case {i} v_cvt_f32_f64({what} {y:e}) = {:e}, want {want:e}",
+                f32::from_bits(got)
+            );
+        });
+    }
+    // An inline f64 constant (242 = 1.0, 247 = -4.0, 248 = 1 / (2 pi)) and a
+    // literal, which is the f64's high dword.
+    let one = [[0u32; 4]];
+    for (src, want) in [
+        (242, 1.0f32),
+        (247, -4.0),
+        (248, (0.5 / std::f64::consts::PI) as f32),
+        (193, f64::from_bits(u64::MAX) as f32), // integer -1: all bits set
+    ] {
+        let shader = build_valu_cs(&[vop1(0x00F, 0, src)]);
+        run_cases(&shader, &one, |backend, _, _, got| {
+            let ok = if want.is_nan() {
+                f32::from_bits(got).is_nan()
+            } else {
+                got == want.to_bits()
+            };
+            assert!(ok, "{backend}: v_cvt_f32_f64(const {src}) = {got:#010x}, want {want:e}");
+        });
+    }
+    let shader = build_valu_cs(&[vop1(0x00F, 0, 255), (b(-6.5) >> 32) as u32]);
+    run_cases(&shader, &one, |backend, _, _, got| {
+        assert_eq!(got, (-6.5f32).to_bits(), "{backend}: v_cvt_f32_f64(literal)");
+    });
+}

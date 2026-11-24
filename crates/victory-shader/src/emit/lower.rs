@@ -6526,6 +6526,12 @@ impl<'a> Lower<'a> {
             return self.packed16(inst, op, guard);
         }
         match name {
+            "v_cvt_f32_f64" => {
+                let x = self.f64_src(inst, 0)?;
+                let bits = self.f64_to_f32_bits(x);
+                let r = self.as_float(bits);
+                float(self, r)
+            }
             "v_mad_u64_u32" => {
                 // a * b + c, c and the result 64 bits wide; the carry out
                 // of the sum is this lane's bit of the mask it names.
@@ -7332,10 +7338,16 @@ impl<'a> Lower<'a> {
         if v.abs >> k & 1 != 0 || v.neg >> k & 1 != 0 || v.sdwa.is_some() || v.dpp.is_some() {
             return Err("64-bit operand modifiers");
         }
+        let op = *v.src.get(k).ok_or("a missing operand")?;
+        self.int64_operand(inst, op)
+    }
+
+    /// A 64-bit integer operand: a register pair, or a constant
+    /// sign-extended (inline) or zero-extended (literal).
+    fn int64_operand(&mut self, inst: &Inst, op: Operand) -> Result<V, Why> {
         let c = self.cur;
         let i64t = self.s.m.int(64);
         self.s.flags |= flags::INT64;
-        let op = *v.src.get(k).ok_or("a missing operand")?;
         let pair = |l: &mut Self, r: Reg, r1: Reg| -> Result<V, Why> {
             let lo = l.i32_of(inst.read(r).ok_or("an unread operand")?)?;
             let hi = l.i32_of(inst.read(r1).ok_or("an unread operand")?)?;
@@ -7356,6 +7368,115 @@ impl<'a> Lower<'a> {
                 Ok(self.s.m.cast(c, Cast::ZExt, x, i64t))
             }
         }
+    }
+
+    /// Source `k` of an f64 operation as its i64 bits, `abs` and `neg`
+    /// applied. Unlike [`Self::src64`], inline float constants are f64
+    /// values and a literal is the high dword (the low one zero).
+    fn f64_src(&mut self, inst: &Inst, k: usize) -> Result<V, Why> {
+        let Fields::Valu(v) = &inst.fields else {
+            unreachable!()
+        };
+        if v.sdwa.is_some() || v.dpp.is_some() {
+            return Err("64-bit operand modifiers");
+        }
+        let c = self.cur;
+        let i64t = self.s.m.int(64);
+        self.s.flags |= flags::INT64;
+        let op = *v.src.get(k).ok_or("a missing operand")?;
+        let mut x = match op {
+            Operand::Const(code @ 240..=248) => {
+                let f = [0.5f64, -0.5, 1.0, -1.0, 2.0, -2.0, 4.0, -4.0];
+                let bits = match f.get(usize::from(code - 240)) {
+                    Some(f) => f.to_bits(),
+                    None => 0x3FC4_5F30_6DC9_C882, // 1 / (2 pi)
+                };
+                self.s.m.int_const(i64t, bits as i64)
+            }
+            Operand::Literal(x) => self.s.m.int_const(i64t, (u64::from(x) << 32) as i64),
+            _ => self.int64_operand(inst, op)?,
+        };
+        let sign = self.s.m.int_const(i64t, i64::MIN);
+        if v.abs >> k & 1 != 0 {
+            let keep = self.s.m.int_const(i64t, i64::MAX);
+            x = self.s.m.bin(c, Bin::And, x, keep);
+        }
+        if v.neg >> k & 1 != 0 {
+            x = self.s.m.bin(c, Bin::Xor, x, sign);
+        }
+        Ok(x)
+    }
+
+    /// f64 bits to f32 bits, rounded to nearest even as the console's
+    /// default MODE does, in integer arithmetic (no host doubles needed).
+    /// f32 denormals are kept, as elsewhere here (MODE is not modelled);
+    /// a NaN stays a NaN, quieted, with the top of its payload.
+    fn f64_to_f32_bits(&mut self, x: V) -> V {
+        let c = self.cur;
+        let i64t = self.s.m.int(64);
+        let k = |l: &mut Self, n: i64| l.s.m.int_const(i64t, n);
+        let (k52, k63) = (k(self, 52), k(self, 63));
+        let (one, zero) = (k(self, 1), k(self, 0));
+        let exp_mask = k(self, 0x7FF);
+        let mant_mask = k(self, (1 << 52) - 1);
+        let shifted = self.s.m.bin(c, Bin::LShr, x, k52);
+        let exp = self.s.m.bin(c, Bin::And, shifted, exp_mask);
+        let mant = self.s.m.bin(c, Bin::And, x, mant_mask);
+        let implicit = k(self, 1 << 52);
+        let full = self.s.m.bin(c, Bin::Or, mant, implicit);
+        // The f32 exponent the value would have; 1 and up is a normal.
+        let bias = k(self, 1023 - 127);
+        let e = self.s.m.bin(c, Bin::Sub, exp, bias);
+        let normal = self.s.m.cmp(c, pred::SGE, e, one);
+        // Bits dropped: 29 for a normal; more for a denormal (30 - e),
+        // capped at 63, past which nothing reaches half the smallest one.
+        let k30 = k(self, 30);
+        let den = self.s.m.bin(c, Bin::Sub, k30, e);
+        let big = self.s.m.cmp(c, pred::SGT, den, k63);
+        let den = self.s.m.select(c, big, k63, den);
+        let k29 = k(self, 29);
+        let drop = self.s.m.select(c, normal, k29, den);
+        let em1 = self.s.m.bin(c, Bin::Sub, e, one);
+        let k23 = k(self, 23);
+        let high = self.s.m.bin(c, Bin::Shl, em1, k23);
+        let high = self.s.m.select(c, normal, high, zero);
+        let kept = self.s.m.bin(c, Bin::LShr, full, drop);
+        // A normal's implicit bit lands on the exponent's lowest bit, which
+        // `e - 1` leaves room for; a carry out of the mantissa raises it.
+        let base = self.s.m.bin(c, Bin::Add, high, kept);
+        let bit = self.s.m.bin(c, Bin::Shl, one, drop);
+        let low_mask = self.s.m.bin(c, Bin::Sub, bit, one);
+        let rem = self.s.m.bin(c, Bin::And, full, low_mask);
+        let half = self.s.m.bin(c, Bin::LShr, bit, one);
+        let above = self.s.m.cmp(c, pred::IUGT, rem, half);
+        let tie = self.s.m.cmp(c, pred::EQ, rem, half);
+        let odd = self.s.m.bin(c, Bin::And, base, one);
+        let odd = self.s.m.cmp(c, pred::NE, odd, zero);
+        let tie_up = self.s.m.bin(c, Bin::And, tie, odd);
+        let up = self.s.m.bin(c, Bin::Or, above, tie_up);
+        let up = self.s.m.cast(c, Cast::ZExt, up, i64t);
+        let mut r = self.s.m.bin(c, Bin::Add, base, up);
+        // Too large: infinity (the rounding reaches it by itself from e 254).
+        let inf = k(self, 0x7F80_0000);
+        let k255 = k(self, 255);
+        let over = self.s.m.cmp(c, pred::SGE, e, k255);
+        r = self.s.m.select(c, over, inf, r);
+        // Zero and f64 denormals lie far below the smallest f32 denormal;
+        // `full` with its implicit bit is wrong for them but drops at 63.
+        // Infinity and NaN.
+        let special = self.s.m.cmp(c, pred::EQ, exp, exp_mask);
+        let payload = self.s.m.bin(c, Bin::LShr, mant, k29);
+        let quiet = k(self, 0x7FC0_0000);
+        let nan = self.s.m.bin(c, Bin::Or, quiet, payload);
+        let is_nan = self.s.m.cmp(c, pred::NE, mant, zero);
+        let special_bits = self.s.m.select(c, is_nan, nan, inf);
+        r = self.s.m.select(c, special, special_bits, r);
+        // The sign.
+        let s = self.s.m.bin(c, Bin::LShr, x, k63);
+        let k31 = k(self, 31);
+        let s = self.s.m.bin(c, Bin::Shl, s, k31);
+        r = self.s.m.bin(c, Bin::Or, r, s);
+        self.s.m.cast(c, Cast::Trunc, r, self.s.t.i32)
     }
 
     fn join64(&mut self, lo: V, hi: V) -> V {
