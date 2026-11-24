@@ -6,6 +6,7 @@
 //! (compiler options) and the zlib-compressed GFX10 code. The bitcode may use
 //! console-only intrinsics, so the GFX10 code is translated in general.
 
+pub mod agility;
 pub mod bvh;
 pub mod dxbc;
 pub mod dxil;
@@ -17,6 +18,10 @@ pub mod native;
 pub mod resource;
 pub mod spill;
 pub mod structure;
+
+// The GPU tests ask for the newer D3D12 runtime too (see `agility`).
+#[cfg(test)]
+crate::agility_exports!();
 
 pub use dxbc::{Container, FourCC, Part};
 pub use dxil::{DxilProgram, ShaderKind, XboxExtras};

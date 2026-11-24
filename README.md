@@ -130,6 +130,15 @@ Requirements: Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with
 shader model 6.6 (and mesh shaders for the world), Rust (pinned in
 `rust-toolchain.toml`).
 
+**Windows 10:** its built-in D3D12 runtime stops at shader model 6.5 on any
+card, so the world does not draw and the GPU tests fail with "no SM 6.6
+device". `cargo xtask agility` fetches Microsoft's DirectX Agility SDK
+(checked against a pinned hash, kept under `target\`) and puts it in a
+`D3D12\` folder beside every build, which `victory.exe` and the GPU tests
+load. Run it again after `cargo clean`; a copied `victory.exe` needs
+`cargo xtask agility --to <its folder>`. Windows 11 does not need it, and
+where the folder is missing Windows keeps its own runtime.
+
 The title also needs several GiB of available Windows commit at startup.
 Check **Committed** under **Task Manager → Performance → Memory**. If
 `crashes.log` reports Windows error 1455, close other applications or increase
@@ -137,6 +146,7 @@ the Windows paging file size, then retry.
 
 ```powershell
 cargo xtask install-hooks                # asset-policy check on every commit
+cargo xtask agility                      # Windows 10: the D3D12 runtime with SM 6.6
 copy victory.example.toml victory.toml   # then set your paths (outside the repo)
 cargo test --workspace                   # needs no game data
 cargo run -p victory -- config           # check your paths

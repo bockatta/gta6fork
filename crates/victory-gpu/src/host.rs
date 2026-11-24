@@ -2757,7 +2757,19 @@ impl Host {
             let mesh = ok
                 && options.MeshShaderTier != D3D12_MESH_SHADER_TIER_NOT_SUPPORTED
                 && model.HighestShaderModel.0 >= D3D_SHADER_MODEL_6_6.0;
-            tracing::info!(mesh, "host mesh shader support");
+            let model = model.HighestShaderModel.0;
+            tracing::info!(
+                mesh,
+                model = format_args!("{model:#x}"),
+                "host mesh shader support"
+            );
+            if ok && model < D3D_SHADER_MODEL_6_6.0 {
+                // Windows 10's own D3D12 runtime stops at 6.5 on any card.
+                tracing::warn!(
+                    "the host D3D12 runtime gives shader model {model:#x}; the world needs 6.6. \
+                     Run `cargo xtask agility` (a D3D12 folder beside victory.exe)"
+                );
+            }
             mesh
         })
     }

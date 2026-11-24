@@ -9,6 +9,10 @@ mod run;
 mod shader;
 mod translate;
 
+// Windows 10 needs the newer D3D12 runtime for shader model 6.6 (see
+// `victory_shader::agility`; `cargo xtask agility` fetches it).
+victory_shader::agility_exports!();
+
 use std::path::PathBuf;
 
 use anyhow::Result;

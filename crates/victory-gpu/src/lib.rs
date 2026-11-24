@@ -56,6 +56,11 @@ mod texture;
 #[cfg(windows)]
 mod watch;
 
+// The GPU tests ask for the newer D3D12 runtime too (see
+// `victory_shader::agility`).
+#[cfg(test)]
+victory_shader::agility_exports!();
+
 #[cfg(windows)]
 pub use host::on_failure;
 #[cfg(windows)]
